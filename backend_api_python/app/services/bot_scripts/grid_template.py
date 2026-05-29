@@ -77,6 +77,7 @@ def on_bar(ctx, bar):
     budget = float(ctx.balance or ctx.equity or 0)
     if budget <= 0:
         budget = amt * grid_count * 2
+    base_step = (amt / price) if price > 0 else 0.0
 
     crossed_down = prev > price
     crossed_up = prev < price
@@ -86,41 +87,42 @@ def on_bar(ctx, bar):
             # Price crossed a grid line going down -> buy.
             if direction in ("long", "neutral"):
                 if short_size > 0:
-                    # First retire as much of the short leg as the grid step
-                    # allows. This realises the matched-grid profit.
-                    use = min(amt, short_size)
-                    ctx.close_short(amount=use, price=price, reason="grid_buy_cover")
-                    short_size -= use
-                    leftover = amt - use
-                    if leftover > 0 and (long_size + leftover) <= budget:
-                        ctx.open_long(amount=leftover, price=price, reason="grid_buy_open")
-                        long_size += leftover
-                elif (long_size + amt) <= budget:
+                    use_base = min(base_step, short_size) if base_step > 0 else short_size
+                    use_usdt = use_base * price if price > 0 else amt
+                    ctx.close_short(amount=use_usdt, price=price, reason="grid_buy_cover")
+                    short_size -= use_base
+                    leftover_usdt = max(0.0, amt - use_usdt)
+                    if leftover_usdt > 0 and (long_size * price + leftover_usdt) <= budget:
+                        ctx.open_long(amount=leftover_usdt, price=price, reason="grid_buy_open")
+                        long_size += leftover_usdt / price if price > 0 else 0.0
+                elif (long_size * price + amt) <= budget:
                     ctx.open_long(amount=amt, price=price, reason="grid_buy_open")
-                    long_size += amt
+                    long_size += base_step
             elif direction == "short" and short_size > 0:
-                # Pure-short grid: buying back reduces the short leg.
-                use = min(amt, short_size)
-                ctx.close_short(amount=use, price=price, reason="grid_buy_cover")
-                short_size -= use
+                use_base = min(base_step, short_size) if base_step > 0 else short_size
+                use_usdt = use_base * price if price > 0 else amt
+                ctx.close_short(amount=use_usdt, price=price, reason="grid_buy_cover")
+                short_size -= use_base
         elif prev <= lv < price and crossed_up:
             # Price crossed a grid line going up -> sell.
             if direction in ("short", "neutral"):
                 if long_size > 0:
-                    use = min(amt, long_size)
-                    ctx.close_long(amount=use, price=price, reason="grid_sell_take")
-                    long_size -= use
-                    leftover = amt - use
-                    if leftover > 0 and (short_size + leftover) <= budget:
-                        ctx.open_short(amount=leftover, price=price, reason="grid_sell_open")
-                        short_size += leftover
-                elif (short_size + amt) <= budget:
+                    use_base = min(base_step, long_size) if base_step > 0 else long_size
+                    use_usdt = use_base * price if price > 0 else amt
+                    ctx.close_long(amount=use_usdt, price=price, reason="grid_sell_take")
+                    long_size -= use_base
+                    leftover_usdt = max(0.0, amt - use_usdt)
+                    if leftover_usdt > 0 and (short_size * price + leftover_usdt) <= budget:
+                        ctx.open_short(amount=leftover_usdt, price=price, reason="grid_sell_open")
+                        short_size += leftover_usdt / price if price > 0 else 0.0
+                elif (short_size * price + amt) <= budget:
                     ctx.open_short(amount=amt, price=price, reason="grid_sell_open")
-                    short_size += amt
+                    short_size += base_step
             elif direction == "long" and long_size > 0:
-                use = min(amt, long_size)
-                ctx.close_long(amount=use, price=price, reason="grid_sell_take")
-                long_size -= use
+                use_base = min(base_step, long_size) if base_step > 0 else long_size
+                use_usdt = use_base * price if price > 0 else amt
+                ctx.close_long(amount=use_usdt, price=price, reason="grid_sell_take")
+                long_size -= use_base
 
     ctx._params["prev_price"] = price
 '''

@@ -454,6 +454,35 @@ class BacktestService:
         item['annual_return'] = result.get('annualReturn')
         item['win_rate'] = result.get('winRate')
         item['total_trades'] = result.get('totalTrades')
+        ea = result.get('executionAssumptions') or {}
+        pi = result.get('precision_info') or {}
+        exec_cfg = (item.get('config_snapshot') or {}).get('executionConfig') or {}
+        mtf_active = bool(ea.get('mtfActive') or pi.get('enabled'))
+        strict_mode = ea.get('strictMode')
+        if strict_mode is None:
+            strict_mode = exec_cfg.get('strictMode')
+        if strict_mode is None:
+            timing = str(
+                ea.get('signalTiming')
+                or (item.get('strategy_config') or {}).get('execution', {}).get('signalTiming')
+                or ''
+            ).lower()
+            strict_mode = timing not in ('same_bar_close', 'current_bar_close', 'bar_close', 'close')
+        simulation_mode = str(
+            ea.get('simulationMode') or pi.get('mode') or pi.get('precision') or ''
+        ).lower()
+        if strict_mode:
+            summary_mode = 'strict'
+        elif mtf_active or simulation_mode in ('aggressive_1m', 'mtf'):
+            summary_mode = 'aggressive_1m'
+        else:
+            summary_mode = 'aggressive_bar'
+        item['simulation_summary'] = {
+            'mode': summary_mode,
+            'strictMode': bool(strict_mode),
+            'execTimeframe': ea.get('executionTimeframe') or pi.get('timeframe') or item.get('timeframe'),
+            'mtfFallbackReason': ea.get('mtfFallbackReason') or pi.get('fallback_reason'),
+        }
         if include_result:
             item['result'] = result
         item.pop('result_json', None)
@@ -514,19 +543,25 @@ class BacktestService:
         # Skip MTF when: disabled, not supported, or signal tf <= exec tf (no precision gain)
         signal_tf_seconds = self.TIMEFRAME_SECONDS.get(timeframe, 86400)
         exec_tf_seconds = self.TIMEFRAME_SECONDS.get(exec_tf, 300) if exec_tf else signal_tf_seconds
+        same_bar_timing = signal_timing in (
+            'same_bar_close', 'current_bar_close', 'bar_close', 'close',
+        )
+        timing_supported = signal_timing in (
+            'next_bar_open', 'next_open', 'nextopen', 'next',
+        ) or same_bar_timing
         skip_mtf = (
             not enable_mtf
             or not precision_info.get('enabled')
             or signal_tf_seconds <= exec_tf_seconds
             or has_scale_rules
-            or signal_timing not in ['next_bar_open', 'next_open', 'nextopen', 'next']
+            or not timing_supported
         )
         
         if skip_mtf:
             fallback_reason = None
             if has_scale_rules:
                 fallback_reason = 'scale_rules_not_supported_in_mtf'
-            elif signal_timing not in ['next_bar_open', 'next_open', 'nextopen', 'next']:
+            elif not timing_supported:
                 fallback_reason = 'signal_timing_not_supported_in_mtf'
             elif not precision_info.get('enabled'):
                 # MTF was disabled by get_execution_timeframe (e.g. range exceeds
@@ -737,6 +772,7 @@ class BacktestService:
         position = 0
         entry_price = 0.0
         position_type = None  # 'long' or 'short'
+        lev = max(int(leverage or 1), 1)
         
         # Parse strategy config
         cfg = strategy_config or {}
@@ -1611,50 +1647,25 @@ class BacktestService:
                 strategy_config=strategy_config,
             )
 
-        if bool(snapshot.get('enable_mtf')) and str(market).lower() in ['crypto', 'cryptocurrency']:
-            result = self.run_multi_timeframe(
-                indicator_code=code,
-                market=market,
-                symbol=symbol,
-                timeframe=timeframe,
-                start_date=start_date,
-                end_date=end_date,
-                initial_capital=initial_capital,
-                commission=commission,
-                slippage=slippage,
-                leverage=leverage,
-                trade_direction=trade_direction,
-                strategy_config=strategy_config,
-                enable_mtf=True,
-                indicator_params=indicator_params,
-                user_id=user_id,
-                indicator_id=indicator_id,
-            )
-        else:
-            result = self.run(
-                indicator_code=code,
-                market=market,
-                symbol=symbol,
-                timeframe=timeframe,
-                start_date=start_date,
-                end_date=end_date,
-                initial_capital=initial_capital,
-                commission=commission,
-                slippage=slippage,
-                leverage=leverage,
-                trade_direction=trade_direction,
-                strategy_config=strategy_config,
-                indicator_params=indicator_params,
-                user_id=user_id,
-                indicator_id=indicator_id,
-            )
-            result['precision_info'] = {
-                'enabled': False,
-                'timeframe': timeframe,
-                'precision': 'standard',
-                'message': 'Using standard strategy backtest'
-            }
-        return result
+        strict_mode = bool(snapshot.get('strict_mode', True))
+        return self.run_aligned(
+            strict_mode=strict_mode,
+            indicator_code=code,
+            market=market,
+            symbol=symbol,
+            timeframe=timeframe,
+            start_date=start_date,
+            end_date=end_date,
+            initial_capital=initial_capital,
+            commission=commission,
+            slippage=slippage,
+            leverage=leverage,
+            trade_direction=trade_direction,
+            strategy_config=strategy_config,
+            indicator_params=indicator_params,
+            user_id=user_id,
+            indicator_id=indicator_id,
+        )
 
     def _run_script_strategy(
         self,
@@ -1753,6 +1764,145 @@ class BacktestService:
             logger.error(traceback.format_exc())
             return {"error": str(e)}
 
+    def run_aligned(
+        self,
+        *,
+        strict_mode: bool = True,
+        indicator_code: str,
+        market: str,
+        symbol: str,
+        timeframe: str,
+        start_date: datetime,
+        end_date: datetime,
+        initial_capital: float = 10000.0,
+        commission: float = 0.001,
+        slippage: float = 0.0,
+        leverage: int = 1,
+        trade_direction: str = 'long',
+        strategy_config: Optional[Dict[str, Any]] = None,
+        indicator_params: Optional[Dict[str, Any]] = None,
+        user_id: int = 1,
+        indicator_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Live-aligned backtest: strict → closed-bar signals + next-bar open;
+        non-strict → same-bar signals + 1m execution path (crypto).
+        """
+        from app.services.backtest_execution import (
+            merge_strict_mode_into_strategy_config,
+            precision_info_for_run,
+        )
+
+        cfg = merge_strict_mode_into_strategy_config(strategy_config, strict_mode)
+        mkt = str(market or '').lower()
+
+        if strict_mode:
+            result = self.run(
+                indicator_code=indicator_code,
+                market=market,
+                symbol=symbol,
+                timeframe=timeframe,
+                start_date=start_date,
+                end_date=end_date,
+                initial_capital=initial_capital,
+                commission=commission,
+                slippage=slippage,
+                leverage=leverage,
+                trade_direction=trade_direction,
+                strategy_config=cfg,
+                indicator_params=indicator_params,
+                user_id=user_id,
+                indicator_id=indicator_id,
+            )
+            result['precision_info'] = precision_info_for_run(
+                strict_mode=True, strategy_timeframe=timeframe,
+            )
+            ea = dict(result.get('executionAssumptions') or {})
+            ea['strictMode'] = True
+            ea['fillRule'] = 'next_bar_open'
+            ea['subResolution'] = 'none'
+            ea['simulationMode'] = 'strict_bar'
+            ea['mtfRequested'] = False
+            ea['mtfActive'] = False
+            result['executionAssumptions'] = ea
+            return result
+
+        if mkt in ('crypto', 'cryptocurrency'):
+            result = self.run_multi_timeframe(
+                indicator_code=indicator_code,
+                market=market,
+                symbol=symbol,
+                timeframe=timeframe,
+                start_date=start_date,
+                end_date=end_date,
+                initial_capital=initial_capital,
+                commission=commission,
+                slippage=slippage,
+                leverage=leverage,
+                trade_direction=trade_direction,
+                strategy_config=cfg,
+                enable_mtf=True,
+                indicator_params=indicator_params,
+                user_id=user_id,
+                indicator_id=indicator_id,
+            )
+            pi_raw = result.get('precision_info') or {}
+            mtf_active = bool(pi_raw.get('enabled'))
+            exec_tf = pi_raw.get('timeframe')
+            fallback = pi_raw.get('fallback_reason')
+            result['precision_info'] = precision_info_for_run(
+                strict_mode=False,
+                strategy_timeframe=timeframe,
+                mtf_active=mtf_active,
+                exec_timeframe=exec_tf,
+                fallback_reason=fallback,
+            )
+            ea = dict(result.get('executionAssumptions') or {})
+            ea['strictMode'] = False
+            ea['fillRule'] = 'intra_bar_1m' if mtf_active else 'same_bar_close'
+            ea['subResolution'] = '1m' if mtf_active else 'none'
+            ea['simulationMode'] = 'aggressive_1m' if mtf_active else 'aggressive_bar'
+            ea['mtfRequested'] = True
+            ea['mtfActive'] = mtf_active
+            if fallback and not mtf_active:
+                ea['mtfFallbackReason'] = fallback
+            result['executionAssumptions'] = ea
+            return result
+
+        result = self.run(
+            indicator_code=indicator_code,
+            market=market,
+            symbol=symbol,
+            timeframe=timeframe,
+            start_date=start_date,
+            end_date=end_date,
+            initial_capital=initial_capital,
+            commission=commission,
+            slippage=slippage,
+            leverage=leverage,
+            trade_direction=trade_direction,
+            strategy_config=cfg,
+            indicator_params=indicator_params,
+            user_id=user_id,
+            indicator_id=indicator_id,
+        )
+        result['precision_info'] = precision_info_for_run(
+            strict_mode=False,
+            strategy_timeframe=timeframe,
+            mtf_active=False,
+            fallback_reason='non_crypto',
+        )
+        ea = dict(result.get('executionAssumptions') or {})
+        ea['strictMode'] = False
+        ea['fillRule'] = 'same_bar_close'
+        ea['subResolution'] = 'none'
+        ea['simulationMode'] = 'aggressive_bar'
+        ea['mtfRequested'] = False
+        ea['mtfActive'] = False
+        ea['mtfFallbackReason'] = 'non_crypto'
+        result['executionAssumptions'] = ea
+        return result
+
     def run(
         self,
         indicator_code: str,
@@ -1811,6 +1961,14 @@ class BacktestService:
         equity_curve, trades, total_commission = self._simulate_trading(
             df, signals, initial_capital, commission, slippage, leverage, trade_direction, strategy_config
         )
+
+        exec_cfg = (strategy_config or {}).get('execution') or {}
+        signal_timing = str(exec_cfg.get('signalTiming') or 'next_bar_open').strip().lower()
+        signal_tf_seconds = self.TIMEFRAME_SECONDS.get(timeframe, 3600)
+        for trade in trades:
+            if not trade.get('bar_time'):
+                trade['bar_time'] = trade.get('time')
+        self._annotate_signal_bar_times(trades, signal_tf_seconds, signal_timing)
         
         # 4. Calculate metrics
         metrics = self._calculate_metrics(equity_curve, trades, initial_capital, timeframe, start_date, end_date, total_commission)
@@ -4912,6 +5070,10 @@ class BacktestService:
         mtf_requested: bool = False,
         mtf_active: bool = False,
         mtf_fallback_reason: Optional[str] = None,
+        commission: Optional[float] = None,
+        slippage: Optional[float] = None,
+        backtest_preset: Optional[str] = None,
+        strict_mode_aligned: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """
         Human-facing metadata so the UI can explain how trades were timed vs chart markers.
@@ -4940,6 +5102,20 @@ class BacktestService:
         }
         if mtf_fallback_reason:
             payload['mtfFallbackReason'] = mtf_fallback_reason
+        try:
+            if commission is not None:
+                payload['commission'] = round(float(commission), 6)
+        except (TypeError, ValueError):
+            pass
+        try:
+            if slippage is not None:
+                payload['slippage'] = round(float(slippage), 6)
+        except (TypeError, ValueError):
+            pass
+        if backtest_preset:
+            payload['backtestPreset'] = str(backtest_preset)
+        if strict_mode_aligned is not None:
+            payload['strictModeAligned'] = bool(strict_mode_aligned)
         return payload
 
     @staticmethod

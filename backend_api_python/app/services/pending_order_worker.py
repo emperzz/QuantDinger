@@ -18,7 +18,14 @@ from app.services.signal_notifier import SignalNotifier
 from app.services.exchange_execution import load_strategy_configs, resolve_exchange_config, safe_exchange_config_for_log
 from app.services.live_trading.execution import place_order_from_signal
 from app.services.live_trading.factory import create_client
-from app.services.live_trading.records import apply_fill_to_local_position, record_trade
+from app.services.live_trading.records import (
+    apply_fill_to_local_position,
+    lookup_exchange_entry_price,
+    lookup_exchange_side_qty,
+    normalize_strategy_symbol,
+    record_trade,
+    strategy_allowed_symbols,
+)
 from app.utils.trade_close_reason import is_exit_trade_type
 from app.services.live_trading.position_query import resolve_reduce_only_quantity
 from app.utils.pnl import calc_notional_value
@@ -343,19 +350,7 @@ class PendingOrderWorker:
                 
                 # Get strategy's trading symbol(s) to filter positions
                 # Only sync positions for symbols that this strategy actually trades
-                strategy_symbol = (sc.get("symbol") or "").strip()
-                trading_config = sc.get("trading_config") or {}
-                symbol_list = trading_config.get("symbol_list") or []
-                # Normalize symbol list: convert to set for fast lookup
-                allowed_symbols = set()
-                if strategy_symbol:
-                    allowed_symbols.add(strategy_symbol.upper())
-                for sym in symbol_list:
-                    if sym and isinstance(sym, str):
-                        bare = sym.strip()
-                        if ":" in bare:
-                            bare = bare.split(":", 1)[-1]
-                        allowed_symbols.add(bare.upper())
+                allowed_symbols = strategy_allowed_symbols(sc)
 
                 # Lazy import MT5 / IBKR / Alpaca clients here so the elif chain
                 # below can rely on isinstance() checks without paying the import
@@ -489,7 +484,14 @@ class PendingOrderWorker:
                                     continue
                                 # instId: BTC-USDT-SWAP -> BTC/USDT
                                 hb_sym = inst_id.replace("-SWAP", "").replace("-", "/")
-                                side = "long" if pos_side == "long" else ("short" if pos_side == "short" else ("long" if pos > 0 else "short"))
+                                if pos_side == "long":
+                                    side = "long"
+                                elif pos_side == "short":
+                                    side = "short"
+                                elif pos_side == "net":
+                                    side = "long" if pos > 0 else "short"
+                                else:
+                                    side = "long" if pos > 0 else "short"
                                 # IMPORTANT: OKX swap positions `pos` is in contracts, but our system uses base-asset quantity.
                                 # Convert contracts -> base using ctVal when available.
                                 qty_base = abs(float(pos))
@@ -803,12 +805,10 @@ class PendingOrderWorker:
                     except Exception:
                         local_size = 0.0
 
-                    exch = exch_size.get(sym) or {}
-                    exch_qty = float(exch.get(side) or 0.0)
+                    exch_qty = lookup_exchange_side_qty(exch_size, sym, side)
 
                     # Lookup entry price
-                    exch_ep_map = exch_entry_price.get(sym) or {}
-                    exch_price = float(exch_ep_map.get(side) or 0.0)
+                    exch_price = lookup_exchange_entry_price(exch_entry_price, sym, side)
 
                     try:
                         local_price = float(r.get("entry_price") or 0.0)
@@ -841,7 +841,7 @@ class PendingOrderWorker:
                 for _sym, _sides_map in exch_size.items():
                     # Filter: only sync positions for symbols that this strategy trades
                     # If strategy has no symbol configured, skip auto-insert to prevent syncing quick trade positions
-                    _sym_upper = _sym.strip().upper()
+                    _sym_upper = normalize_strategy_symbol(_sym).upper()
                     if allowed_symbols and _sym_upper not in allowed_symbols:
                         logger.debug(f"[PositionSync] Skipping {_sym}: not in strategy's symbol list (strategy trades: {allowed_symbols})")
                         continue

@@ -414,6 +414,11 @@ def run_strategy_backtest():
 
         svc = get_backtest_service()
         result = svc.run_strategy_snapshot(snapshot, start_date=start_date, end_date=end_date)
+        ea = dict(result.get('executionAssumptions') or {})
+        ea['commission'] = round(float(snapshot.get('commission') or 0), 6)
+        ea['slippage'] = round(float(snapshot.get('slippage') or 0), 6)
+        ea['strictMode'] = bool(snapshot.get('strict_mode', True))
+        result['executionAssumptions'] = ea
         run_id = svc.persist_run(
             user_id=user_id,
             indicator_id=snapshot.get('indicator_id'),
@@ -917,6 +922,28 @@ def get_positions():
             )
             rows = cur.fetchall() or []
             cur.close()
+
+        if not rows:
+            try:
+                from app.services.live_trading.records import rebuild_positions_from_trades
+
+                if rebuild_positions_from_trades(strategy_id):
+                    with get_db_connection() as db:
+                        cur = db.cursor()
+                        cur.execute(
+                            """
+                            SELECT id, strategy_id, symbol, side, size, entry_price, current_price, highest_price,
+                                   unrealized_pnl, pnl_percent, equity, updated_at
+                            FROM qd_strategy_positions
+                            WHERE strategy_id = ?
+                            ORDER BY id DESC
+                            """,
+                            (strategy_id,),
+                        )
+                        rows = cur.fetchall() or []
+                        cur.close()
+            except Exception as e:
+                logger.warning("rebuild_positions_from_trades failed for strategy %s: %s", strategy_id, e)
 
         # Sync current price and PnL on read (frontend polls every few seconds).
         now = int(time.time())

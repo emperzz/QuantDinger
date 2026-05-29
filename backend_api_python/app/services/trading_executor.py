@@ -608,6 +608,7 @@ class TradingExecutor:
         symbol: str,
         initial_capital: Optional[float] = None,
         current_price: Optional[float] = None,
+        trading_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         ctx.position.clear_position()
         pl = self._get_current_positions(strategy_id, symbol)
@@ -625,6 +626,21 @@ class TradingExecutor:
                     ctx.position.open_long(ep, size)
                 elif side == 'short':
                     ctx.position.open_short(ep, size)
+
+        # Grid bots need accurate per-leg state. When DB is empty/stale (e.g.
+        # after restart + sync lag), fall back to the exchange book.
+        tc = trading_config if isinstance(trading_config, dict) else {}
+        bot_type = self._bot_type_key(tc)
+        if bot_type == "grid" and str(tc.get("execution_mode") or "live").strip().lower() == "live":
+            self._hydrate_grid_ctx_from_exchange_best_effort(
+                ctx,
+                strategy_id=strategy_id,
+                symbol=symbol,
+                current_price=current_price,
+                trading_config=tc,
+                db_had_long=ctx.position.has_long(),
+                db_had_short=ctx.position.has_short(),
+            )
         # 把 ctx.balance 刷新为最新权益(初始资金 + 已实现盈亏 + 未实现盈亏),
         # 这样趋势等使用 ctx.balance * POS_PCT 计算仓位的脚本能反映真实资金
         try:
@@ -640,6 +656,72 @@ class TradingExecutor:
                 ctx.equity = float(eq)
         except Exception:
             pass
+
+    def _hydrate_grid_ctx_from_exchange_best_effort(
+        self,
+        ctx: StrategyScriptContext,
+        *,
+        strategy_id: int,
+        symbol: str,
+        current_price: Optional[float],
+        trading_config: Dict[str, Any],
+        db_had_long: bool,
+        db_had_short: bool,
+    ) -> None:
+        """Fill missing grid legs from the exchange when local DB snapshot is empty."""
+        if db_had_long and db_had_short:
+            return
+        ex_cfg = trading_config.get("exchange_config") or {}
+        if not isinstance(ex_cfg, dict) or not (
+            ex_cfg.get("api_key") or ex_cfg.get("apiKey")
+        ):
+            return
+        market_type = str(trading_config.get("market_type") or "swap").strip().lower()
+        try:
+            from app.services.live_trading.factory import create_client
+            from app.services.live_trading.position_query import query_exchange_position_size
+
+            client = create_client(ex_cfg, market_type=market_type)
+            ref_px = float(current_price or 0.0)
+            for side in ("long", "short"):
+                if side == "long" and db_had_long:
+                    continue
+                if side == "short" and db_had_short:
+                    continue
+                sz = query_exchange_position_size(
+                    client=client,
+                    symbol=str(symbol or ""),
+                    pos_side=side,
+                    market_type=market_type,
+                    exchange_config=ex_cfg,
+                )
+                if sz <= 0:
+                    continue
+                if side == "long":
+                    ctx.position.open_long(ref_px, sz)
+                else:
+                    ctx.position.open_short(ref_px, sz)
+                try:
+                    from app.services.live_trading.records import upsert_position
+
+                    upsert_position(
+                        strategy_id=int(strategy_id),
+                        symbol=str(symbol or ""),
+                        side=side,
+                        size=float(sz),
+                        entry_price=float(ref_px or 0.0),
+                        current_price=float(ref_px or 0.0),
+                    )
+                except Exception:
+                    pass
+                logger.info(
+                    "Grid hydrate from exchange: %s %s size=%s (db missing leg)",
+                    symbol,
+                    side,
+                    sz,
+                )
+        except Exception as e:
+            logger.warning("Grid exchange hydrate skipped for %s: %s", symbol, e)
 
     def _init_script_strategy_context(
         self,
@@ -877,23 +959,35 @@ class TradingExecutor:
 
             # ---- Explicit hedge intents from the new ctx API -----------------
             if intent == 'close_long':
+                close_qty = local_qty
+                if close_qty <= 0 and ctx.position.has_long():
+                    close_qty = ctx.position.long_size
+                if close_qty <= 0:
+                    continue
+                avg_entry = 0.0
                 if ctx.position.has_long():
-                    closed_qty, avg_entry = ctx.position.reduce_long(local_qty or ctx.position.long_size)
-                    _emit({
-                        'type': 'close_long', 'trigger_price': ref_px,
-                        'position_size': pos_ratio if local_qty else 0,
-                        'timestamp': ts_i, 'matched_entry_price': avg_entry,
-                    }, reason_hint or ('grid_reduce_long' if is_grid_bot else None))
+                    _, avg_entry = ctx.position.reduce_long(close_qty)
+                _emit({
+                    'type': 'close_long', 'trigger_price': ref_px,
+                    'position_size': pos_ratio if local_qty else 0,
+                    'timestamp': ts_i, 'matched_entry_price': avg_entry,
+                }, reason_hint or ('grid_reduce_long' if is_grid_bot else None))
                 continue
 
             if intent == 'close_short':
+                close_qty = local_qty
+                if close_qty <= 0 and ctx.position.has_short():
+                    close_qty = ctx.position.short_size
+                if close_qty <= 0:
+                    continue
+                avg_entry = 0.0
                 if ctx.position.has_short():
-                    closed_qty, avg_entry = ctx.position.reduce_short(local_qty or ctx.position.short_size)
-                    _emit({
-                        'type': 'close_short', 'trigger_price': ref_px,
-                        'position_size': pos_ratio if local_qty else 0,
-                        'timestamp': ts_i, 'matched_entry_price': avg_entry,
-                    }, reason_hint or ('grid_reduce_short' if is_grid_bot else None))
+                    _, avg_entry = ctx.position.reduce_short(close_qty)
+                _emit({
+                    'type': 'close_short', 'trigger_price': ref_px,
+                    'position_size': pos_ratio if local_qty else 0,
+                    'timestamp': ts_i, 'matched_entry_price': avg_entry,
+                }, reason_hint or ('grid_reduce_short' if is_grid_bot else None))
                 continue
 
             if intent == 'open_long':
@@ -1023,6 +1117,7 @@ class TradingExecutor:
             ctx, strategy_id, symbol,
             initial_capital=_init_cap,
             current_price=_bar_close_for_hydrate,
+            trading_config=trading_config,
         )
         ctx._orders = []
         bar = ScriptBar(
@@ -1101,6 +1196,7 @@ class TradingExecutor:
             ctx, strategy_id, symbol,
             initial_capital=_init_cap,
             current_price=_bar_close_for_hydrate,
+            trading_config=trading_config,
         )
         ctx._orders = []
         bar_ts = df.index[pos]
@@ -1395,6 +1491,10 @@ class TradingExecutor:
 
             # Best-effort: query the real fee tier from the exchange (cached per strategy)
             exchange_config = strategy.get('exchange_config') or {}
+            if isinstance(trading_config, dict):
+                trading_config.setdefault('execution_mode', execution_mode)
+                if exchange_config:
+                    trading_config.setdefault('exchange_config', exchange_config)
             kline_exchange_id, kline_market_type = self._live_crypto_kline_params(
                 market_category=market_category,
                 market_type=market_type,
@@ -1482,6 +1582,7 @@ class TradingExecutor:
                         script_ctx, strategy_id, symbol,
                         initial_capital=initial_capital,
                         current_price=(float(df['close'].iloc[-1]) if df is not None and len(df) > 0 else None),
+                        trading_config=trading_config,
                     )
                     try:
                         on_init_script(script_ctx)
@@ -1715,6 +1816,7 @@ class TradingExecutor:
                                     script_ctx, strategy_id, symbol,
                                     initial_capital=initial_capital,
                                     current_price=float(current_price),
+                                    trading_config=trading_config,
                                 )
                                 script_ctx._orders = []
                                 tick_bar = ScriptBar(

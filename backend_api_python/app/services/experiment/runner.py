@@ -319,7 +319,7 @@ class ExperimentRunnerService:
                 'trade_direction': snap.get('trade_direction', 'long'),
                 'market_type': 'swap',
                 'strategy_config': strategy_config,
-                'enable_mtf': snap.get('enable_mtf', True),
+                'strict_mode': snap.get('strict_mode', True),
             },
             'exchange_config': {},
         }
@@ -791,7 +791,7 @@ class ExperimentRunnerService:
                 'indicator_params': base.get('indicatorParams') or {},
                 'indicator_id': base.get('indicatorId'),
                 'user_id': user_id,
-                'enable_mtf': bool(base.get('enableMtf', True)),
+                'strict_mode': bool(base.get('strictMode', base.get('strict_mode', True))),
                 'run_type': str(base.get('runType') or 'indicator'),
             }
         snapshot['user_id'] = user_id

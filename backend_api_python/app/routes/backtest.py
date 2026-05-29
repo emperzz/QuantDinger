@@ -162,7 +162,8 @@ def run_backtest():
         endDate: End date (YYYY-MM-DD)
         initialCapital: Initial capital (default 10000)
         commission: Commission rate (default 0.001)
-        enableMtf: Enable multi-timeframe backtest (default true, only for crypto)
+        enableMtf: Enable multi-timeframe backtest (deprecated; use strictMode)
+        strictMode: Strict mode (default true). Off uses aggressive same-bar / 1m path for crypto.
     """
     try:
         data = request.get_json()
@@ -184,16 +185,25 @@ def run_backtest():
         timeframe = data.get('timeframe', '1D')
         start_date_str = data.get('startDate', '')
         end_date_str = data.get('endDate', '')
+        from app.services.backtest_execution import (
+            default_slippage_if_missing,
+            parse_strict_mode,
+            merge_strict_mode_into_strategy_config,
+        )
+
+        strict_mode = parse_strict_mode(
+            data.get('strictMode', data.get('strict_mode')),
+            default=True,
+        )
         initial_capital = float(data.get('initialCapital', 10000))
         commission = float(data.get('commission', 0.001))
-        slippage = float(data.get('slippage', 0.0))
+        slippage = default_slippage_if_missing(data.get('slippage'))
         leverage = int(data.get('leverage', 1))
         trade_direction = data.get('tradeDirection', 'long')  # long, short, both
-        strategy_config = data.get('strategyConfig') or {}
-        # 多时间框架回测开关（默认开启，仅加密货币市场有效）
-        enable_mtf = data.get('enableMtf', True)
-        if isinstance(enable_mtf, str):
-            enable_mtf = enable_mtf.lower() in ['true', '1', 'yes']
+        strategy_config = merge_strict_mode_into_strategy_config(
+            data.get('strategyConfig') or {},
+            strict_mode,
+        )
         # persist toggle: skip DB write when False for faster iteration
         persist = data.get('persist', True)
         if isinstance(persist, str):
@@ -255,49 +265,30 @@ def run_backtest():
             f"[BacktestRequest] user={user_id} indicator={indicator_id} {market}:{symbol} "
             f"tf={timeframe} range=[{start_date_str} ~ {end_date_str}] ({days_diff}d) "
             f"capital={initial_capital} leverage={leverage} direction={trade_direction} "
-            f"mtf={enable_mtf}"
+            f"strict_mode={strict_mode}"
         )
 
-        # 执行回测（支持多时间框架高精度回测）
-        # 加密货币市场且启用MTF时，使用多时间框架回测
-        if enable_mtf and market.lower() in ['crypto', 'cryptocurrency']:
-            result = backtest_service.run_multi_timeframe(
-                indicator_code=indicator_code,
-                market=market,
-                symbol=symbol,
-                timeframe=timeframe,
-                start_date=start_date,
-                end_date=end_date,
-                initial_capital=initial_capital,
-                commission=commission,
-                slippage=slippage,
-                leverage=leverage,
-                trade_direction=trade_direction,
-                strategy_config=strategy_config,
-                enable_mtf=True
-            )
-        else:
-            result = backtest_service.run(
-                indicator_code=indicator_code,
-                market=market,
-                symbol=symbol,
-                timeframe=timeframe,
-                start_date=start_date,
-                end_date=end_date,
-                initial_capital=initial_capital,
-                commission=commission,
-                slippage=slippage,
-                leverage=leverage,
-                trade_direction=trade_direction,
-                strategy_config=strategy_config
-            )
-            # 添加标准回测的精度信息
-            result['precision_info'] = {
-                'enabled': False,
-                'timeframe': timeframe,
-                'precision': 'standard',
-                'message': '使用标准K线回测'
-            }
+        result = backtest_service.run_aligned(
+            strict_mode=strict_mode,
+            indicator_code=indicator_code,
+            market=market,
+            symbol=symbol,
+            timeframe=timeframe,
+            start_date=start_date,
+            end_date=end_date,
+            initial_capital=initial_capital,
+            commission=commission,
+            slippage=slippage,
+            leverage=leverage,
+            trade_direction=trade_direction,
+            strategy_config=strategy_config,
+        )
+
+        ea = dict(result.get('executionAssumptions') or {})
+        ea['commission'] = round(float(commission), 6)
+        ea['slippage'] = round(float(slippage), 6)
+        ea['strictMode'] = bool(strict_mode)
+        result['executionAssumptions'] = ea
 
         run_id = None
         if persist:
@@ -316,7 +307,12 @@ def run_backtest():
                 leverage=leverage,
                 trade_direction=trade_direction,
                 strategy_config=strategy_config,
-                config_snapshot={'indicatorId': int(indicator_id) if indicator_id is not None else None},
+                config_snapshot={
+                    'indicatorId': int(indicator_id) if indicator_id is not None else None,
+                    'executionConfig': {
+                        'strictMode': bool(strict_mode),
+                    },
+                },
                 status='success',
                 error_message='',
                 result=result,

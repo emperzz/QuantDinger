@@ -9,7 +9,7 @@ Important:
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from app.utils.db import get_db_connection
 
@@ -71,6 +71,141 @@ def _fetch_position_fuzzy(strategy_id: int, symbol: str, side: str) -> Tuple[Dic
             return row, db_sym or sym
     canon = normalize_strategy_symbol(symbol) or str(symbol or "").strip()
     return {}, canon
+
+
+def strategy_allowed_symbols(strategy_config: Dict[str, Any]) -> Set[str]:
+    """
+    Symbols a strategy is allowed to own in ``qd_strategy_positions``.
+
+    Used by position sync to avoid pulling unrelated exchange positions while
+    still covering the common case where the symbol lives only in
+    ``trading_config['symbol']`` (grid/bot strategies).
+    """
+    allowed: Set[str] = set()
+    trading_config = strategy_config.get("trading_config") or {}
+    if not isinstance(trading_config, dict):
+        trading_config = {}
+
+    for raw in (strategy_config.get("symbol"), trading_config.get("symbol")):
+        norm = normalize_strategy_symbol(str(raw or "").strip())
+        if norm:
+            allowed.add(norm.upper())
+
+    for sym in trading_config.get("symbol_list") or []:
+        if not sym or not isinstance(sym, str):
+            continue
+        bare = sym.strip()
+        if ":" in bare:
+            bare = bare.split(":", 1)[-1]
+        norm = normalize_strategy_symbol(bare)
+        if norm:
+            allowed.add(norm.upper())
+    return allowed
+
+
+def lookup_exchange_side_qty(
+    exch_size: Dict[str, Dict[str, float]],
+    symbol: str,
+    side: str,
+) -> float:
+    """Resolve exchange size for a local row, tolerating BTC/USDT vs BTCUSDT keys."""
+    side_l = str(side or "").strip().lower()
+    if side_l not in ("long", "short"):
+        return 0.0
+    norm_index: Dict[str, Dict[str, float]] = {}
+    for sym_key, sides in (exch_size or {}).items():
+        norm = normalize_strategy_symbol(str(sym_key or "").strip()).upper()
+        if not norm:
+            continue
+        bucket = norm_index.setdefault(norm, {"long": 0.0, "short": 0.0})
+        for leg in ("long", "short"):
+            try:
+                bucket[leg] = max(float(bucket.get(leg) or 0.0), float((sides or {}).get(leg) or 0.0))
+            except Exception:
+                pass
+    for sym in _position_symbol_candidates(symbol):
+        norm = normalize_strategy_symbol(sym).upper()
+        if norm in norm_index:
+            try:
+                return float(norm_index[norm].get(side_l) or 0.0)
+            except Exception:
+                return 0.0
+    return 0.0
+
+
+def lookup_exchange_entry_price(
+    exch_entry_price: Dict[str, Dict[str, float]],
+    symbol: str,
+    side: str,
+) -> float:
+    side_l = str(side or "").strip().lower()
+    if side_l not in ("long", "short"):
+        return 0.0
+    norm_index: Dict[str, Dict[str, float]] = {}
+    for sym_key, sides in (exch_entry_price or {}).items():
+        norm = normalize_strategy_symbol(str(sym_key or "").strip()).upper()
+        if not norm:
+            continue
+        bucket = norm_index.setdefault(norm, {"long": 0.0, "short": 0.0})
+        for leg in ("long", "short"):
+            try:
+                ep = float((sides or {}).get(leg) or 0.0)
+                if ep > 0:
+                    bucket[leg] = ep
+            except Exception:
+                pass
+    for sym in _position_symbol_candidates(symbol):
+        norm = normalize_strategy_symbol(sym).upper()
+        if norm in norm_index:
+            try:
+                return float(norm_index[norm].get(side_l) or 0.0)
+            except Exception:
+                return 0.0
+    return 0.0
+
+
+def rebuild_positions_from_trades(strategy_id: int) -> bool:
+    """
+    Rebuild local position rows by replaying trade history.
+
+    Best-effort repair when trades were recorded but the position snapshot was
+    never written (older workers) or was cleared by a failed sync.
+    """
+    sid = int(strategy_id)
+    if sid <= 0:
+        return False
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            "SELECT COUNT(*) AS c FROM qd_strategy_positions WHERE strategy_id = %s",
+            (sid,),
+        )
+        existing = int((cur.fetchone() or {}).get("c") or 0)
+        if existing > 0:
+            cur.close()
+            return False
+        cur.execute(
+            """
+            SELECT type, symbol, amount, price
+            FROM qd_strategy_trades
+            WHERE strategy_id = %s
+            ORDER BY id ASC
+            """,
+            (sid,),
+        )
+        trades = cur.fetchall() or []
+        cur.close()
+    if not trades:
+        return False
+    for row in trades:
+        apply_fill_to_local_position(
+            strategy_id=sid,
+            symbol=str(row.get("symbol") or ""),
+            signal_type=str(row.get("type") or ""),
+            filled=float(row.get("amount") or 0.0),
+            avg_price=float(row.get("price") or 0.0),
+        )
+    return True
 
 
 def _resolve_write_symbol(current: Dict[str, Any], cur_size: float, input_symbol: str) -> str:
