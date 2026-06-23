@@ -111,6 +111,7 @@ class StrategyReviewService:
         metrics = self._build_metrics(
             strategy=strategy,
             trading_config=trading_config,
+            all_trades=all_trades,
             trades=trades,
             positions=positions,
             lookback_days=lookback_days,
@@ -400,6 +401,7 @@ class StrategyReviewService:
         *,
         strategy: Dict[str, Any],
         trading_config: Dict[str, Any],
+        all_trades: List[Dict[str, Any]],
         trades: List[Dict[str, Any]],
         positions: List[Dict[str, Any]],
         lookback_days: int,
@@ -411,6 +413,11 @@ class StrategyReviewService:
         leverage = _as_float(trading_config.get("leverage") or strategy.get("leverage"), 1.0)
         if leverage <= 0:
             leverage = 1.0
+        performance = self._build_performance_snapshot(
+            initial_capital=initial_capital,
+            trades=all_trades,
+            positions=positions,
+        )
 
         opening_events = [t for t in trades if not is_exit_trade_type(str(t.get("type") or ""))]
         closing_events = [t for t in trades if is_exit_trade_type(str(t.get("type") or "")) or t.get("profit") is not None]
@@ -448,7 +455,7 @@ class StrategyReviewService:
         unrealized = sum(_as_float(p.get("unrealized_pnl"), 0.0) for p in positions)
         current_equity = equity + unrealized if initial_capital > 0 or trades else unrealized
         max_drawdown_pct = (max_drawdown / peak * 100.0) if peak > 0 else 0.0
-        total_return_pct = (total_net_pnl / initial_capital * 100.0) if initial_capital > 0 else 0.0
+        window_return_pct = (total_net_pnl / initial_capital * 100.0) if initial_capital > 0 else 0.0
 
         fee_total = sum(_as_float(t.get("commission"), 0.0) for t in trades)
         notional_total = sum(_as_float(t.get("value"), 0.0) for t in trades)
@@ -488,11 +495,24 @@ class StrategyReviewService:
             "open_position_count": len(positions),
             "open_position_notional": _round(sum(_as_float(p.get("size"), 0.0) * _as_float(p.get("current_price") or p.get("entry_price"), 0.0) for p in positions), 4),
             "unrealized_pnl": _round(unrealized, 4),
-            "current_equity": _round(current_equity, 4),
+            "current_equity": _round(performance.get("latest_equity", current_equity), 4),
             "total_net_pnl": _round(total_net_pnl, 4),
-            "total_return_pct": _round(total_return_pct, 4),
-            "max_drawdown": _round(max_drawdown, 4),
-            "max_drawdown_pct": _round(max_drawdown_pct, 4),
+            "window_net_pnl": _round(total_net_pnl, 4),
+            "window_return_pct": _round(window_return_pct, 4),
+            "window_max_drawdown": _round(max_drawdown, 4),
+            "window_max_drawdown_pct": _round(max_drawdown_pct, 4),
+            "performance_initial_equity": _round(performance.get("initial_equity", initial_capital), 4),
+            "performance_latest_equity": _round(performance.get("latest_equity", current_equity), 4),
+            "performance_total_return": _round(performance.get("total_return", 0.0), 4),
+            "performance_total_return_pct": _round(performance.get("total_return_pct", 0.0), 4),
+            "performance_max_drawdown": _round(performance.get("max_drawdown", 0.0), 4),
+            "performance_max_drawdown_pct": _round(performance.get("max_drawdown_pct", 0.0), 4),
+            "performance_points": int(performance.get("points") or 0),
+            # Backward-compatible aliases used by the frontend. These are aligned
+            # with the strategy performance page, not the selected lookback window.
+            "total_return_pct": _round(performance.get("total_return_pct", 0.0), 4),
+            "max_drawdown": _round(performance.get("max_drawdown", 0.0), 4),
+            "max_drawdown_pct": _round(performance.get("max_drawdown_pct", 0.0), 4),
             "win_rate": _round(win_rate, 4),
             "winning_trades": len(wins),
             "losing_trades": len(losses),
@@ -514,7 +534,69 @@ class StrategyReviewService:
             "entry_exit_imbalance": len(opening_events) - len(closing_events),
         }
 
-    def _build_rule_review(
+    def _build_performance_snapshot(
+        self,
+        *,
+        initial_capital: float,
+        trades: List[Dict[str, Any]],
+        positions: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Mirror the strategy performance tab's equity-curve KPI math."""
+        initial = _as_float(initial_capital, 0.0)
+        if initial <= 0:
+            initial = 1000.0
+
+        equity = initial
+        curve: List[Dict[str, Any]] = []
+        if trades:
+            curve.append({"time": _row_ts(trades[0]), "equity": round(initial, 2)})
+
+        for trade in trades:
+            equity += _as_float(net_pnl_for_equity_step(trade), 0.0)
+            curve.append({"time": _row_ts(trade), "equity": round(equity, 2)})
+
+        unrealized = sum(_as_float(p.get("unrealized_pnl"), 0.0) for p in positions)
+        live_equity = equity + unrealized
+        if abs(unrealized) > 1e-12 or not curve:
+            curve.append({"time": int(time.time()), "equity": round(live_equity, 2)})
+
+        summary = self._summarize_equity_curve(initial=initial, curve=curve)
+        summary["points"] = len(curve)
+        return summary
+
+    def _summarize_equity_curve(self, *, initial: float, curve: List[Dict[str, Any]]) -> Dict[str, Any]:
+        init = _as_float(initial, 0.0)
+        if init <= 0:
+            init = 1000.0
+        latest = _as_float(curve[-1].get("equity"), init) if curve else init
+        total_return = latest - init
+        total_return_pct = (total_return / init * 100.0) if init > 0 else 0.0
+
+        peak = init
+        max_drawdown = 0.0
+        max_drawdown_pct = 0.0
+        for point in curve or []:
+            equity = _as_float(point.get("equity"), 0.0)
+            if equity > peak:
+                peak = equity
+            drawdown = peak - equity
+            if drawdown > max_drawdown:
+                max_drawdown = drawdown
+            if peak > 0:
+                drawdown_pct = drawdown / peak * 100.0
+                if drawdown_pct > max_drawdown_pct:
+                    max_drawdown_pct = drawdown_pct
+
+        return {
+            "initial_equity": round(init, 2),
+            "latest_equity": round(latest, 2),
+            "total_return": round(total_return, 2),
+            "total_return_pct": round(total_return_pct, 2),
+            "max_drawdown": round(max_drawdown, 2),
+            "max_drawdown_pct": round(max_drawdown_pct, 2),
+        }
+
+    def _legacy_build_rule_review(
         self,
         *,
         metrics: Dict[str, Any],
@@ -679,7 +761,7 @@ class StrategyReviewService:
 
         return diagnostics, recommendations
 
-    def _build_ai_review(self, *, base_report: Dict[str, Any], language: str) -> Dict[str, Any]:
+    def _legacy_build_ai_review(self, *, base_report: Dict[str, Any], language: str) -> Dict[str, Any]:
         default = {
             "enabled": True,
             "status": "fallback",
@@ -756,7 +838,7 @@ class StrategyReviewService:
             return [value.strip()]
         return fallback
 
-    def _fallback_summary_zh(self, metrics: Dict[str, Any], diagnostics: List[Dict[str, Any]]) -> str:
+    def _legacy_fallback_summary_zh(self, metrics: Dict[str, Any], diagnostics: List[Dict[str, Any]]) -> str:
         return (
             f"最近{metrics.get('lookback_days', 30)}天共有{metrics.get('closed_trades_with_pnl', 0)}笔已实现盈亏交易，"
             f"净盈亏{metrics.get('total_net_pnl', 0)}，胜率{metrics.get('win_rate', 0)}%，"
@@ -764,7 +846,7 @@ class StrategyReviewService:
             f"规则引擎识别到{len(diagnostics)}个复盘要点。"
         )
 
-    def _fallback_summary_en(self, metrics: Dict[str, Any], diagnostics: List[Dict[str, Any]]) -> str:
+    def _legacy_fallback_summary_en(self, metrics: Dict[str, Any], diagnostics: List[Dict[str, Any]]) -> str:
         return (
             f"Over the last {metrics.get('lookback_days', 30)} days, the strategy has "
             f"{metrics.get('closed_trades_with_pnl', 0)} closed PnL trades, net PnL "
@@ -772,6 +854,415 @@ class StrategyReviewService:
             f"profit factor {metrics.get('profit_factor', 0)}, and max drawdown "
             f"{metrics.get('max_drawdown_pct', 0)}%. The rule engine found "
             f"{len(diagnostics)} review point(s)."
+        )
+
+    def _build_rule_review(
+        self,
+        *,
+        metrics: Dict[str, Any],
+        strategy: Dict[str, Any],
+        trading_config: Dict[str, Any],
+        bot_type: str,
+        language: str = "zh-CN",
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        diagnostics: List[Dict[str, Any]] = []
+        recommendations: List[Dict[str, Any]] = []
+        is_zh = str(language or "").lower().startswith("zh")
+
+        def text(en: str, zh: str) -> str:
+            return zh if is_zh else en
+
+        def diag(severity: str, code: str, title: str, detail: str, value: Any = None) -> None:
+            diagnostics.append({
+                "severity": severity,
+                "code": code,
+                "title": title,
+                "detail": detail,
+                "value": value,
+            })
+
+        def rec(priority: str, code: str, title: str, detail: str) -> None:
+            recommendations.append({
+                "priority": priority,
+                "code": code,
+                "title": title,
+                "detail": detail,
+            })
+
+        close_count = _as_int(metrics.get("closed_trades_with_pnl"))
+        window_net = _as_float(metrics.get("window_net_pnl", metrics.get("total_net_pnl")))
+        performance_return_pct = _as_float(metrics.get("performance_total_return_pct", metrics.get("total_return_pct")))
+
+        if close_count < 5:
+            diag(
+                "info",
+                "sample_small",
+                text("Sample is still small", "样本仍然偏少"),
+                text(
+                    "Fewer than 5 closed trades have realised PnL in the selected review window. Treat the conclusion as directional.",
+                    "所选复盘周期内已实现盈亏的平仓交易少于 5 笔，结论只能作为方向性参考。",
+                ),
+                close_count,
+            )
+            rec(
+                "medium",
+                "collect_more",
+                text("Collect more closed trades", "先积累更多平仓样本"),
+                text(
+                    "Keep the report in observe mode until the strategy has at least 10-20 closed trades.",
+                    "建议至少积累 10-20 笔已平仓交易后，再判断策略参数是否需要调整。",
+                ),
+            )
+
+        if window_net < 0:
+            diag(
+                "warning",
+                "negative_expectancy_window",
+                text("Review-window realised PnL is negative", "复盘窗口已实现净盈亏为负"),
+                text(
+                    "The strategy lost money after fees in the selected review window.",
+                    "所选复盘周期内，策略扣除手续费后的已实现净盈亏为负。",
+                ),
+                window_net,
+            )
+            rec(
+                "high",
+                "reduce_risk_until_retested",
+                text("Reduce risk before expanding capital", "扩大资金前先降低风险"),
+                text(
+                    "Do not increase leverage or capital until the next backtest or out-of-sample check improves expectancy.",
+                    "在回测或样本外验证改善前，不建议提高杠杆或投入资金。",
+                ),
+            )
+
+        pf = _as_float(metrics.get("profit_factor"))
+        if close_count >= 5 and pf < 1:
+            diag(
+                "warning",
+                "profit_factor_below_one",
+                text("Profit factor is below 1", "盈亏比低于 1"),
+                text(
+                    "Winning trades are not covering losing trades and fees.",
+                    "盈利交易不足以覆盖亏损交易和手续费。",
+                ),
+                pf,
+            )
+            rec(
+                "high",
+                "review_entry_exit_filters",
+                text("Review entry and exit filters", "复查入场与出场过滤条件"),
+                text(
+                    "Check whether entries are too early, exits are too late, or the strategy is being used in the wrong market regime.",
+                    "需要检查是否入场过早、出场过晚，或者策略被用于不适合的市场状态。",
+                ),
+            )
+
+        wr = _as_float(metrics.get("win_rate"))
+        if close_count >= 5 and wr < 35:
+            diag(
+                "warning",
+                "low_win_rate",
+                text("Win rate is low", "胜率偏低"),
+                text(
+                    "The strategy loses more often than it wins. This is only acceptable when average wins are much larger than losses.",
+                    "策略亏损频率偏高，只有当平均盈利显著大于平均亏损时才可能合理。",
+                ),
+                wr,
+            )
+            rec(
+                "medium",
+                "tighten_signal_quality",
+                text("Tighten signal quality", "提高信号质量门槛"),
+                text(
+                    "Consider adding trend, volatility, or volume confirmation before new entries.",
+                    "可考虑增加趋势、波动率或成交量确认后再开仓。",
+                ),
+            )
+
+        max_dd_pct = _as_float(metrics.get("performance_max_drawdown_pct", metrics.get("max_drawdown_pct")))
+        if max_dd_pct >= 10:
+            diag(
+                "danger",
+                "large_drawdown",
+                text("Performance drawdown is elevated", "绩效回撤偏高"),
+                text(
+                    "The performance-page equity path shows a meaningful peak-to-trough drop.",
+                    "按绩效页同口径计算的权益曲线出现了明显峰谷回撤。",
+                ),
+                max_dd_pct,
+            )
+            rec(
+                "high",
+                "cap_position_size",
+                text("Cap position size", "限制单次仓位"),
+                text(
+                    "Lower entry percentage or maximum position while this strategy is under review.",
+                    "在复盘观察期内，建议降低开仓比例或最大持仓上限。",
+                ),
+            )
+
+        consecutive_losses = _as_int(metrics.get("max_consecutive_losses"))
+        if consecutive_losses >= 3:
+            diag(
+                "warning",
+                "loss_streak",
+                text("Consecutive losses detected", "出现连续亏损"),
+                text(
+                    "The strategy had a losing streak that can pressure margin and operator confidence.",
+                    "连续亏损会对保证金和执行信心造成压力。",
+                ),
+                consecutive_losses,
+            )
+            rec(
+                "medium",
+                "add_cooldown",
+                text("Add a cooldown after loss streaks", "连续亏损后增加冷却期"),
+                text(
+                    "Consider pausing new entries after 3 consecutive realised losses until the next confirmed setup.",
+                    "可考虑连续 3 笔已实现亏损后暂停新开仓，等待下一次确认信号。",
+                ),
+            )
+
+        fee_ratio = _as_float(metrics.get("fee_to_abs_pnl"))
+        if _as_float(metrics.get("total_commission")) > 0 and (fee_ratio >= 0.5 or (abs(window_net) < 1e-9 and close_count > 0)):
+            diag(
+                "warning",
+                "fees_are_material",
+                text("Fees are material", "手续费侵蚀明显"),
+                text(
+                    "Commissions are large compared with realised PnL, so small edges may be erased.",
+                    "手续费相对已实现盈亏占比较高，小幅优势可能被交易成本吞掉。",
+                ),
+                metrics.get("total_commission"),
+            )
+            rec(
+                "medium",
+                "reduce_churn",
+                text("Reduce churn or improve execution", "降低交易频率或优化成交方式"),
+                text(
+                    "Use fewer but higher-quality signals, maker orders where appropriate, or wider grid spacing.",
+                    "可减少低质量信号、优先使用 maker 挂单，或适当放宽网格间距。",
+                ),
+            )
+
+        if bot_type in ("grid", "dca"):
+            neg_pairs = _as_int(metrics.get("grid_negative_pairs"))
+            matched = _as_int(metrics.get("grid_matched_pairs"))
+            if matched > 0 and neg_pairs > 0:
+                diag(
+                    "warning",
+                    "grid_negative_pairs",
+                    text("Some grid matches closed below net profit", "部分网格配对净利润为负"),
+                    text(
+                        "Grid matched rows include negative net PnL after fees.",
+                        "网格配对成交中存在扣除手续费后为负的记录。",
+                    ),
+                    {"negative": neg_pairs, "matched": matched},
+                )
+                rec(
+                    "high",
+                    "grid_profit_floor",
+                    text("Check grid spacing versus fees", "检查网格间距是否覆盖手续费"),
+                    text(
+                        "Increase grid spacing or lower trading frequency so each matched pair covers both entry and exit fees.",
+                        "建议加大网格间距或降低交易频率，确保每次配对能覆盖开平两侧手续费。",
+                    ),
+                )
+
+        imbalance = _as_int(metrics.get("entry_exit_imbalance"))
+        if imbalance >= 3:
+            diag(
+                "info",
+                "many_unclosed_entries",
+                text("Many entries are not closed yet", "存在较多未闭合开仓"),
+                text(
+                    "The trade log has more opens than exits in the selected review window.",
+                    "所选复盘周期内开仓次数明显多于平仓次数。",
+                ),
+                imbalance,
+            )
+            rec(
+                "medium",
+                "review_exposure",
+                text("Review accumulated exposure", "复查累计敞口"),
+                text(
+                    "Make sure the strategy is intentionally scaling in and that max position limits are active.",
+                    "确认这是有意加仓，并且最大持仓限制已经生效。",
+                ),
+            )
+
+        if _as_int(metrics.get("open_position_count")) > 0:
+            diag(
+                "info",
+                "open_positions_present",
+                text("Open positions are present", "当前仍有未平仓"),
+                text(
+                    "The report includes unrealized PnL, but final performance is not locked until positions close.",
+                    "报告会展示未实现盈亏，但最终表现要等仓位平掉后才能确认。",
+                ),
+                metrics.get("open_position_count"),
+            )
+
+        if performance_return_pct < 0 and window_net >= 0:
+            diag(
+                "info",
+                "window_and_performance_differ",
+                text("Window PnL and performance return differ", "窗口盈亏与绩效收益率口径不同"),
+                text(
+                    "The selected review window can be profitable while the full performance equity curve remains negative.",
+                    "所选复盘窗口可能是盈利的，但全量绩效权益曲线仍可能为负。",
+                ),
+                {"window_net_pnl": window_net, "performance_total_return_pct": performance_return_pct},
+            )
+
+        if not diagnostics:
+            diag(
+                "success",
+                "no_major_issue",
+                text("No obvious issue in this window", "当前周期未发现明显异常"),
+                text(
+                    "The deterministic checks did not find a clear risk concentration. Continue monitoring sample size and live execution drift.",
+                    "规则检查没有发现明显风险集中点，建议继续观察样本量和实盘偏差。",
+                ),
+                None,
+            )
+            rec(
+                "low",
+                "keep_monitoring",
+                text("Keep monitoring", "继续观察"),
+                text(
+                    "No automatic parameter change is recommended from this sample alone.",
+                    "仅凭当前样本，不建议自动修改策略参数。",
+                ),
+            )
+
+        return diagnostics, recommendations
+
+    def _build_ai_review(self, *, base_report: Dict[str, Any], language: str) -> Dict[str, Any]:
+        language_norm = str(language or "").lower()
+        is_zh = language_norm.startswith("zh")
+        is_zh_tw = is_zh and ("tw" in language_norm or "hant" in language_norm)
+        metrics = base_report.get("metrics") or {}
+        diagnostics = base_report.get("diagnostics") or []
+        recommendations = base_report.get("recommendations") or []
+
+        default = {
+            "enabled": True,
+            "status": "fallback",
+            "source": "rules",
+            "provider": "",
+            "model": "",
+            "elapsed_ms": 0,
+            "summary": self._fallback_summary_zh(metrics, diagnostics) if is_zh else self._fallback_summary_en(metrics, diagnostics),
+            "diagnosis": [d.get("detail") or d.get("title") for d in diagnostics[:5]],
+            "recommendations": [r.get("detail") or r.get("title") for r in recommendations[:5]],
+            "cautions": [
+                "这是基于成交记录、持仓和规则指标生成的复盘，不会自动修改策略参数。"
+                if is_zh else
+                "This review is based on trades, positions, and rule metrics. It does not change parameters automatically."
+            ],
+            "report": "",
+            "error": "",
+        }
+
+        started = time.time()
+        try:
+            llm = LLMService()
+            provider = llm.provider
+            model = llm.get_default_model(provider)
+            default["provider"] = provider.value
+            default["model"] = model
+
+            if not llm.get_api_key(provider):
+                default["error"] = f"LLM provider {provider.value} has no API key configured."
+                default["report"] = default["error"]
+                return default
+
+            payload = {
+                "strategy": base_report.get("strategy"),
+                "metric_definitions": {
+                    "window_net_pnl": "realized net PnL after fees inside the selected review window",
+                    "performance_total_return_pct": "same return percentage as the performance page, based on the full equity curve",
+                    "performance_max_drawdown_pct": "same max drawdown percentage as the performance page",
+                },
+                "metrics": metrics,
+                "diagnostics": diagnostics[:8],
+                "rule_recommendations": recommendations[:8],
+            }
+            system_prompt = (
+                "You are a professional quantitative trading strategy reviewer. "
+                "Use only the provided metrics and diagnostics. Do not invent trades, prices, dates, or parameters. "
+                "Clearly distinguish selected-window realised PnL from full performance-page return/drawdown. "
+                "Return strict JSON with keys: summary, diagnosis, recommendations, cautions. "
+                "diagnosis, recommendations, and cautions must be arrays of short strings."
+            )
+            if is_zh_tw:
+                system_prompt += " Write in Traditional Chinese."
+            elif is_zh:
+                system_prompt += " Write in Simplified Chinese."
+            else:
+                system_prompt += " Write in concise professional English."
+
+            result = llm.safe_call_llm(
+                system_prompt=system_prompt,
+                user_prompt=json.dumps(payload, ensure_ascii=False, default=str),
+                default_structure=dict(default),
+                model=model,
+                provider=provider,
+            )
+            default["elapsed_ms"] = int((time.time() - started) * 1000)
+            if not isinstance(result, dict):
+                default["error"] = "LLM returned a non-object result."
+                default["report"] = default["error"]
+                return default
+
+            report_text = str(result.get("report") or "").strip()
+            failed = report_text.startswith("Analysis failed") or report_text.startswith("Failed to parse")
+            if failed:
+                default["error"] = report_text
+                default["report"] = report_text
+                return default
+
+            out = dict(default)
+            out.update({
+                "status": "ok",
+                "source": "llm",
+                "summary": str(result.get("summary") or default["summary"]).strip(),
+                "diagnosis": self._as_str_list(result.get("diagnosis"), default["diagnosis"]),
+                "recommendations": self._as_str_list(result.get("recommendations"), default["recommendations"]),
+                "cautions": self._as_str_list(result.get("cautions"), default["cautions"]),
+                "report": report_text,
+                "error": "",
+            })
+            return out
+        except Exception as exc:
+            logger.warning("AI strategy review failed: %s", exc, exc_info=True)
+            default["elapsed_ms"] = int((time.time() - started) * 1000)
+            default["error"] = str(exc)
+            default["report"] = str(exc)
+            return default
+
+    def _fallback_summary_zh(self, metrics: Dict[str, Any], diagnostics: List[Dict[str, Any]]) -> str:
+        return (
+            f"近{metrics.get('lookback_days', 30)}天复盘窗口内共有"
+            f"{metrics.get('closed_trades_with_pnl', 0)}笔已实现盈亏交易，"
+            f"窗口已实现净盈亏{metrics.get('window_net_pnl', metrics.get('total_net_pnl', 0))}；"
+            f"绩效页同口径收益率{metrics.get('performance_total_return_pct', metrics.get('total_return_pct', 0))}%，"
+            f"最大回撤{metrics.get('performance_max_drawdown_pct', metrics.get('max_drawdown_pct', 0))}%。"
+            f"窗口胜率{metrics.get('win_rate', 0)}%，盈亏比{metrics.get('profit_factor', 0)}。"
+            f"规则引擎识别到{len(diagnostics)}个复盘要点。"
+        )
+
+    def _fallback_summary_en(self, metrics: Dict[str, Any], diagnostics: List[Dict[str, Any]]) -> str:
+        return (
+            f"Over the last {metrics.get('lookback_days', 30)} days, the selected review window has "
+            f"{metrics.get('closed_trades_with_pnl', 0)} closed PnL trades and realised net PnL "
+            f"{metrics.get('window_net_pnl', metrics.get('total_net_pnl', 0))}. "
+            f"The performance-page aligned return is "
+            f"{metrics.get('performance_total_return_pct', metrics.get('total_return_pct', 0))}%, "
+            f"with max drawdown {metrics.get('performance_max_drawdown_pct', metrics.get('max_drawdown_pct', 0))}%. "
+            f"Window win rate is {metrics.get('win_rate', 0)}% and profit factor is {metrics.get('profit_factor', 0)}. "
+            f"The rule engine found {len(diagnostics)} review point(s)."
         )
 
     def _compact_trade(self, trade: Dict[str, Any]) -> Dict[str, Any]:

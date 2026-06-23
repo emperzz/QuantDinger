@@ -84,6 +84,16 @@ def backtest_range_policy(market: str, timeframe: str) -> BacktestRangePolicy:
     )
 
 
+def _date_limit_start(end_date: datetime, max_days: int, warmup_seconds: int) -> datetime:
+    """Return a date-only friendly start that keeps the fetch window under max_days."""
+    return end_date - timedelta(days=max(0, int(max_days) - 1)) + timedelta(seconds=warmup_seconds)
+
+
+def _date_limit_end(fetch_start: datetime, max_days: int) -> datetime:
+    """Return a date-only friendly end that keeps the fetch window under max_days."""
+    return fetch_start + timedelta(days=max(0, int(max_days) - 1))
+
+
 def validate_backtest_range(
     *,
     market: str,
@@ -106,11 +116,38 @@ def validate_backtest_range(
     warmup_note = ""
     if warmup_bars:
         warmup_note = f" including {int(warmup_bars)} warmup bars"
+    warmup_days = int((warmup_seconds + 86399) // 86400)
+    recommendation_available = warmup_seconds < policy.max_days * 86400
+    recommended_start_str = None
+    recommended_end_str = None
+    recommendation_msg = (
+        "Please shorten the date range or use a higher timeframe."
+    )
+    if recommendation_available:
+        recommended_start = _date_limit_start(end_date, policy.max_days, warmup_seconds)
+        if recommended_start > end_date:
+            recommended_start = end_date
+        recommended_end = _date_limit_end(fetch_start, policy.max_days)
+        if recommended_end > end_date:
+            recommended_end = end_date
+        recommended_start_str = recommended_start.strftime("%Y-%m-%d")
+        recommended_end_str = recommended_end.strftime("%Y-%m-%d")
+        recommendation_msg = (
+            f"Please shorten the date range or use a higher timeframe. "
+            f"Suggested fix: use {recommended_start_str} to {end_date.strftime('%Y-%m-%d')} "
+            f"to keep the current end date, or keep start date {start_date.strftime('%Y-%m-%d')} "
+            f"and set end date to {recommended_end_str}."
+        )
+    elif warmup_bars:
+        recommendation_msg = (
+            "The indicator warmup alone exceeds this data provider limit. "
+            "Reduce long lookback parameters, reduce warmup requirements, or use a higher timeframe."
+        )
     msg = (
         f"Backtest range exceeds limit: {market}:{symbol} timeframe {timeframe} "
         f"supports up to {policy.label} ({policy.max_days} days) because of the "
         f"{policy.reason}, but this request needs {fetch_days} days{warmup_note}. "
-        f"Please shorten the date range or use a higher timeframe."
+        f"{recommendation_msg}"
     )
     return {
         "error_type": "BACKTEST_RANGE_LIMIT",
@@ -124,7 +161,11 @@ def validate_backtest_range(
         "selected_days": selected_days,
         "fetch_days": fetch_days,
         "warmup_bars": int(warmup_bars or 0),
+        "warmup_days": warmup_days,
         "fetch_start": fetch_start.strftime("%Y-%m-%d"),
         "requested_start": start_date.strftime("%Y-%m-%d"),
         "requested_end": end_date.strftime("%Y-%m-%d"),
+        "recommendation_available": recommendation_available,
+        "recommended_start": recommended_start_str,
+        "recommended_end": recommended_end_str,
     }
